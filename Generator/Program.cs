@@ -91,8 +91,8 @@ internal static class Program
                     return;
                 }
 
-                await using (var fileStr = File.Create(pkgPath))
-                    await resp.Content.CopyToAsync(fileStr);
+                await using var fileStr = File.Create(pkgPath);
+                await resp.Content.CopyToAsync(fileStr);
             }
             
             Console.WriteLine("Extracting the Payload Archive");
