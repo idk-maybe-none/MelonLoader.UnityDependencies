@@ -47,7 +47,7 @@ internal static class Program
         http.DefaultRequestHeaders.Add("User-Agent", Config.UserAgent);
 
         Console.WriteLine("Fetching available releases");
-        var versions = await GetAvailableVersionsAsync();
+        var versions = await GetAvailableVersionsAsync(latestBuildsOnly: false);
 
         Console.WriteLine("Fetching existing releases");
         var releases = await github.Repository.Release.GetAll(repoOwner, repoName);
