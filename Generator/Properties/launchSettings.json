@@ -2,7 +2,7 @@
   "profiles": {
     "Generator": {
       "commandName": "Project",
-      "commandLineArgs": "LavaGang MelonLoader.UnityDependencies main"
+      "commandLineArgs": "idk-maybe-none MelonLoader.UnityDependencies main"
     }
   }
 }
