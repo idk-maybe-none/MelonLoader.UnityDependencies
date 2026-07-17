@@ -1,4 +1,4 @@
-﻿using Generator.ResponseModels;
+using Generator.ResponseModels;
 using Octokit;
 using System.IO.Compression;
 using System.Net.Http.Headers;
@@ -16,7 +16,7 @@ internal static class Program
     private static bool isDryRun;
 
     private static readonly GitHubClient github = new(new Octokit.ProductHeaderValue("MelonLoader.UnityDependencies"));
-    
+
     private static readonly HttpClient http = new()
     {
         Timeout = TimeSpan.FromMinutes(10)
@@ -28,11 +28,11 @@ internal static class Program
         {
             throw new ArgumentException("The generator requires the following arguments: Repo Owner, Repo Name, Main Branch Name");
         }
-        
+
         repoOwner = args[0];
         repoName = args[1];
         repoMainBranch = args[2];
-        
+
         var token = Environment.GetEnvironmentVariable("GH_TOKEN");
         if (string.IsNullOrEmpty(token))
         {
@@ -43,21 +43,131 @@ internal static class Program
         {
             github.Credentials = new(token);
         }
-        
+
         http.DefaultRequestHeaders.Add("User-Agent", Config.UserAgent);
 
         Console.WriteLine("Fetching available releases");
-        var versions = await GetAvailableVersionsAsync();
+        var versions = await GetAvailableVersionsAsync(latestBuildsOnly: false);
 
         Console.WriteLine("Fetching existing releases");
         var releases = await github.Repository.Release.GetAll(repoOwner, repoName);
-        
+
         foreach (var version in versions)
         {
-            if (releases.Any(x => x.TagName == version.ShortName))
-                continue;
+            var existingRelease = releases.FirstOrDefault(x => x.TagName == version.ShortName);
+            if (existingRelease == null)
+            {
+                await ProcessVersionAsync(version);
+            }
+            else
+            {
+                await BackfillSymSoAsync(version, existingRelease);
+            }
+        }
+    }
 
-            await ProcessVersionAsync(version);
+    private static async Task BackfillSymSoAsync(UnityVersion version, Release existingRelease)
+    {
+        // Exclude older versions that do not have the android support bundle
+        if (version.Major < 5 || version is { Major: 5, Minor: < 3 })
+            return;
+
+        // Check if any .sym.so assets are missing
+        var expectedArchs = new[] { "armeabi-v7a", "arm64-v8a", "x86", "armv9", "x86_64" };
+        var missingArchs = new List<string>();
+
+        foreach (var arch in expectedArchs)
+        {
+            var symAssetName = $"libunity.sym.so.{arch}";
+            if (!existingRelease.Assets.Any(a => a.Name == symAssetName))
+            {
+                // Also check if the .so exists for this arch - if not, skip
+                var soAssetName = $"libunity.so.{arch}";
+                if (existingRelease.Assets.Any(a => a.Name == soAssetName))
+                {
+                    missingArchs.Add(arch);
+                }
+            }
+        }
+
+        if (missingArchs.Count == 0)
+        {
+            Console.WriteLine($"Version {version} already has all .sym.so assets. Skipping...");
+            return;
+        }
+
+        Console.WriteLine();
+        Console.WriteLine($"Backfilling .sym.so for version {version} (missing: {string.Join(", ", missingArchs)})");
+
+        var monoBundleUrl = $"https://download.unity3d.com/download_unity/{version.Id}/MacEditorTargetInstaller/UnitySetup-Android-Support-for-Editor-{version}.pkg";
+
+        var tempDir = Path.Combine(Path.GetDirectoryName(Environment.ProcessPath)!, "gen.temp");
+        if (Directory.Exists(tempDir))
+        {
+            Directory.Delete(tempDir, true);
+        }
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            var pkgPath = Path.Combine(tempDir, "mono.pkg");
+
+            Console.WriteLine("Downloading the Android Bundle");
+            using (var resp = await http.GetAsync(monoBundleUrl, HttpCompletionOption.ResponseContentRead))
+            {
+                if (!resp.IsSuccessStatusCode)
+                {
+                    Console.WriteLine("No bundle found. Skipping...");
+                    return;
+                }
+
+                await using var fileStr = File.Create(pkgPath);
+                await resp.Content.CopyToAsync(fileStr);
+            }
+
+            Console.WriteLine("Extracting the Payload Archive");
+            await SevenZip.ExtractAsync(pkgPath, tempDir, false, "TargetSupport.pkg.tmp/Payload");
+            File.Delete(pkgPath);
+
+            var payloadArchPath = Path.Combine(tempDir, "Payload");
+            Console.WriteLine("Extracting the Payload Archive Archive");
+            await SevenZip.ExtractAsync(payloadArchPath, tempDir, false);
+            File.Delete(payloadArchPath);
+
+            var payloadPath = Path.Combine(tempDir, "Payload~");
+            Console.WriteLine("Extracting the last one...");
+            await SevenZip.ExtractAsync(payloadPath, tempDir, true, "./Variations/il2cpp/Managed/*", "./Variations/il2cpp/Release/Libs/*", "./Variations/il2cpp/Release/Symbols/*");
+            File.Delete(payloadPath);
+
+            var symbolsDir = Path.Combine(tempDir, "Variations", "il2cpp", "Release", "Symbols");
+
+            if (!isDryRun)
+            {
+                foreach (var arch in missingArchs)
+                {
+                    var symPath = Path.Combine(symbolsDir, arch, "libunity.sym.so");
+
+                    if (!File.Exists(symPath))
+                    {
+                        Console.WriteLine($"  Warning: libunity.sym.so not found for {arch} in version {version}");
+                        continue;
+                    }
+
+                    var assetName = $"libunity.sym.so.{arch}";
+                    Console.WriteLine($"Uploading {assetName}");
+                    await using var assetStr = File.OpenRead(symPath);
+                    await github.Repository.Release.UploadAsset(existingRelease, new(assetName, "application/x-msdownload", assetStr, TimeSpan.FromMinutes(10)));
+                }
+            }
+            else
+            {
+                Console.WriteLine("Dry run - would upload missing .sym.so files");
+            }
+
+            Console.WriteLine("Done.");
+        }
+        finally
+        {
+            Directory.Delete(tempDir, true);
         }
     }
 
@@ -66,7 +176,7 @@ internal static class Program
         // Exclude older versions that do not have the android support bundle
         if (version.Major < 5 || version is { Major: 5, Minor: < 3 })
             return;
-        
+
         Console.WriteLine();
         Console.WriteLine($"Processing version {version}");
 
@@ -81,7 +191,7 @@ internal static class Program
         try
         {
             var pkgPath = Path.Combine(tempDir, "mono.pkg");
-            
+
             Console.WriteLine("Downloading the Android Bundle");
             using (var resp = await http.GetAsync(monoBundleUrl, HttpCompletionOption.ResponseContentRead))
             {
@@ -94,24 +204,25 @@ internal static class Program
                 await using var fileStr = File.Create(pkgPath);
                 await resp.Content.CopyToAsync(fileStr);
             }
-            
+
             Console.WriteLine("Extracting the Payload Archive");
             await SevenZip.ExtractAsync(pkgPath, tempDir, false, "TargetSupport.pkg.tmp/Payload");
             File.Delete(pkgPath);
-            
+
             var payloadArchPath = Path.Combine(tempDir, "Payload");
             Console.WriteLine("Extracting the Payload Archive Archive");
             await SevenZip.ExtractAsync(payloadArchPath, tempDir, false);
             File.Delete(payloadArchPath);
-            
+
             var payloadPath = Path.Combine(tempDir, "Payload~");
             Console.WriteLine("Extracting the last one...");
-            await SevenZip.ExtractAsync(payloadPath, tempDir, true, "./Variations/il2cpp/Managed/*", "./Variations/il2cpp/Release/Libs/*");
+            await SevenZip.ExtractAsync(payloadPath, tempDir, true, "./Variations/il2cpp/Managed/*", "./Variations/il2cpp/Release/Libs/*", "./Variations/il2cpp/Release/Symbols/*");
             File.Delete(payloadPath);
-            
+
             var managedDir = Path.Combine(tempDir, "Variations", "il2cpp", "Managed");
             var libsDir = Path.Combine(tempDir, "Variations", "il2cpp", "Release", "Libs");
-            
+            var symbolsDir = Path.Combine(tempDir, "Variations", "il2cpp", "Release", "Symbols");
+
             Console.WriteLine("Bundling Managed.zip");
             using var managedZipStr = new MemoryStream();
             using (var managedZip = new ZipArchive(managedZipStr, ZipArchiveMode.Create, true))
@@ -143,17 +254,26 @@ internal static class Program
 
                 foreach (var dir in Directory.EnumerateDirectories(libsDir))
                 {
-                    var libunityPath = Path.Combine(dir, "libunity.so");
-                    if (!File.Exists(libunityPath))
-                        continue;
-
                     var arch = Path.GetFileName(dir);
 
-                    var assetName = $"libunity.so.{arch}";
+                    var libunityPath = Path.Combine(dir, "libunity.so");
+                    if (File.Exists(libunityPath))
+                    {
+                        var assetName = $"libunity.so.{arch}";
+                        Console.WriteLine($"Uploading {assetName}");
+                        await using var assetStr = File.OpenRead(libunityPath);
+                        await github.Repository.Release.UploadAsset(release, new(assetName, "application/x-msdownload", assetStr, TimeSpan.FromMinutes(10)));
+                    }
 
-                    Console.WriteLine($"Uploading {assetName}");
-                    await using var assetStr = File.OpenRead(libunityPath);
-                    await github.Repository.Release.UploadAsset(release, new(assetName, "application/x-msdownload", assetStr, TimeSpan.FromMinutes(10)));
+                    // Upload .sym.so if present
+                    var symSoPath = Path.Combine(symbolsDir, arch, "libunity.sym.so");
+                    if (File.Exists(symSoPath))
+                    {
+                        var symAssetName = $"libunity.sym.so.{arch}";
+                        Console.WriteLine($"Uploading {symAssetName}");
+                        await using var symStr = File.OpenRead(symSoPath);
+                        await github.Repository.Release.UploadAsset(release, new(symAssetName, "application/x-msdownload", symStr, TimeSpan.FromMinutes(10)));
+                    }
                 }
 
                 // Undraft it, at which point it becomes public
@@ -161,7 +281,21 @@ internal static class Program
                 releaseUpdate.Draft = false;
                 await github.Repository.Release.Edit(repoOwner, repoName, release.Id, releaseUpdate);
             }
-            
+            else
+            {
+                Console.WriteLine("Dry run - would create release and upload assets");
+                foreach (var dir in Directory.EnumerateDirectories(libsDir))
+                {
+                    var arch = Path.GetFileName(dir);
+                    var libunityPath = Path.Combine(dir, "libunity.so");
+                    var symSoPath = Path.Combine(symbolsDir, arch, "libunity.sym.so");
+                    if (File.Exists(libunityPath))
+                        Console.WriteLine($"  Would upload libunity.so.{arch}");
+                    if (File.Exists(symSoPath))
+                        Console.WriteLine($"  Would upload libunity.sym.so.{arch}");
+                }
+            }
+
             Console.WriteLine("Done.");
         }
         finally

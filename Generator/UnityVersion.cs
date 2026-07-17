@@ -9,7 +9,7 @@ public struct UnityVersion
     public required int BuildNumber { get; set; }
     public required string Id { get; set; }
     
-    public string ShortName => $"{Major}.{Minor}.{Patch}";
+    public string ShortName => $"{Major}.{Minor}.{Patch}{BuildType}{BuildNumber}";
 
     public readonly override string ToString()
         => $"{Major}.{Minor}.{Patch}{BuildType}{BuildNumber}";
